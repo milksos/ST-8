@@ -14,27 +14,37 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
 public class App {
-    private static final String BASE_URL = "https://www.papercdcase.com/";
-    private static final Path DATA_FILE = Paths.get("data", "data.txt");
-    private static final Path RESULT_DIR = Paths.get("result").toAbsolutePath();
-    private static final Path RESULT_FILE = RESULT_DIR.resolve("cd.pdf");
-    private static final Path TEMP_RESULT_FILE = RESULT_DIR.resolve("cd-new.pdf");
-    private static final Path LOCAL_DRIVER = Paths.get("drivers", "chromedriver-win64", "chromedriver.exe");
+    private static final String PAPER_CD_CASE_URL = "https://www.papercdcase.com/";
+    private static final Path DATA_PATH = Paths.get("data", "data.txt");
+    private static final Path XPATHS_PATH = Paths.get("data", "xpaths.txt");
+    private static final Path OUTPUT_DIRECTORY = Paths.get("result").toAbsolutePath();
+    private static final Path OUTPUT_FILE = OUTPUT_DIRECTORY.resolve("cd.pdf");
+    private static final Path DOWNLOADED_FILE = OUTPUT_DIRECTORY.resolve("papercdcase.pdf");
+    private static final Path TEMP_FILE = OUTPUT_DIRECTORY.resolve("cd-download.pdf");
 
     public static void main(String[] args) throws IOException {
-        CdData data = readData(DATA_FILE);
-        Files.createDirectories(RESULT_DIR);
-        Files.deleteIfExists(TEMP_RESULT_FILE);
+        AlbumData albumData = loadAlbumData(DATA_PATH);
+        Map<String, String> xpaths = loadXpaths(XPATHS_PATH);
 
-        if (Files.exists(LOCAL_DRIVER)) {
-            System.setProperty("webdriver.chrome.driver", LOCAL_DRIVER.toAbsolutePath().toString());
+        Files.createDirectories(OUTPUT_DIRECTORY);
+        Files.deleteIfExists(TEMP_FILE);
+
+        WebDriver driver = new ChromeDriver(createChromeOptions());
+        try {
+            fillFormAndDownload(driver, albumData, xpaths);
+            System.out.println("CD cover saved to " + OUTPUT_FILE);
+        } finally {
+            driver.quit();
         }
+    }
 
+    private static ChromeOptions createChromeOptions() {
         ChromeOptions options = new ChromeOptions();
         options.setAcceptInsecureCerts(true);
         options.addArguments("--ignore-certificate-errors");
@@ -44,96 +54,119 @@ public class App {
             options.addArguments("--headless=new");
         }
 
-        Map<String, Object> prefs = new HashMap<>();
-        prefs.put("download.default_directory", RESULT_DIR.toString());
-        prefs.put("download.prompt_for_download", false);
-        prefs.put("plugins.always_open_pdf_externally", true);
-        options.setExperimentalOption("prefs", prefs);
+        Map<String, Object> preferences = new HashMap<>();
+        preferences.put("download.default_directory", OUTPUT_DIRECTORY.toString());
+        preferences.put("download.prompt_for_download", false);
+        preferences.put("plugins.always_open_pdf_externally", true);
+        options.setExperimentalOption("prefs", preferences);
 
-        WebDriver webDriver = new ChromeDriver(options);
-        try {
-            WebDriverWait wait = new WebDriverWait(webDriver, Duration.ofSeconds(30));
-            webDriver.get(BASE_URL);
+        return options;
+    }
 
-            wait.until(ExpectedConditions.visibilityOfElementLocated(By.name("artist"))).sendKeys(data.artist());
-            webDriver.findElement(By.name("title")).sendKeys(data.title());
+    private static void fillFormAndDownload(WebDriver driver, AlbumData albumData, Map<String, String> xpaths)
+            throws IOException {
+        WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(30));
 
-            for (int i = 0; i < data.tracks().size(); i++) {
-                webDriver.findElement(By.name("track" + (i + 1))).sendKeys(data.tracks().get(i));
-            }
+        driver.get(PAPER_CD_CASE_URL);
 
-            webDriver.findElement(By.cssSelector("input[name='template'][value='jewel']")).click();
-            webDriver.findElement(By.cssSelector("input[name='size'][value='a4']")).click();
+        wait.until(ExpectedConditions.visibilityOfElementLocated(By.xpath(xpaths.get("Artist"))))
+                .sendKeys(albumData.artist());
+        driver.findElement(By.xpath(xpaths.get("Title"))).sendKeys(albumData.album());
 
-            WebElement forceSaveAs = webDriver.findElement(By.cssSelector("input[name='force_saveas'][value='yes']"));
-            if (!forceSaveAs.isSelected()) {
-                forceSaveAs.click();
-            }
+        List<WebElement> trackFields = driver.findElements(By.xpath(xpaths.get("Tracks")));
+        for (int index = 0; index < albumData.tracks().size() && index < trackFields.size(); index++) {
+            trackFields.get(index).sendKeys(albumData.tracks().get(index));
+        }
 
-            WebElement btn = webDriver.findElement(By.name("submit"));
-            btn.submit();
+        selectOption(driver, xpaths.get("Type - Jewel case"));
+        selectOption(driver, xpaths.get("Paper - A4"));
+        selectOption(driver, xpaths.get("Force Save As - Yes"));
 
-            waitForPdf();
-            System.out.println("PDF saved to " + RESULT_FILE);
-        } finally {
-            webDriver.quit();
+        driver.findElement(By.xpath(xpaths.get("Generate button"))).submit();
+        waitForPdfDownload();
+    }
+
+    private static void selectOption(WebDriver driver, String xpath) {
+        WebElement element = driver.findElement(By.xpath(xpath));
+        if (!element.isSelected()) {
+            element.click();
         }
     }
 
-    private static CdData readData(Path path) throws IOException {
+    private static AlbumData loadAlbumData(Path path) throws IOException {
         List<String> lines = Files.readAllLines(path, StandardCharsets.UTF_8).stream()
                 .map(String::trim)
                 .filter(line -> !line.isEmpty())
                 .collect(Collectors.toList());
 
         if (lines.size() < 3) {
-            throw new IllegalArgumentException("data/data.txt must contain artist, album title and at least one track.");
+            throw new IllegalArgumentException("data.txt must contain artist, album title and track list.");
         }
 
-        List<String> tracks = lines.subList(2, Math.min(lines.size(), 18));
-        if (tracks.size() > 16) {
-            tracks = tracks.subList(0, 16);
-        }
-
-        return new CdData(lines.get(0), lines.get(1), tracks);
+        List<String> tracks = lines.subList(2, Math.min(lines.size(), 20));
+        return new AlbumData(lines.get(0), lines.get(1), tracks);
     }
 
-    private static void waitForPdf() {
+    private static Map<String, String> loadXpaths(Path path) throws IOException {
+        Map<String, String> values = createDefaultXpaths();
+
+        if (!Files.exists(path)) {
+            return values;
+        }
+
+        for (String line : Files.readAllLines(path, StandardCharsets.UTF_8)) {
+            String normalized = line.trim();
+            if (normalized.isEmpty() || normalized.startsWith("#")) {
+                continue;
+            }
+
+            int separator = normalized.indexOf(':');
+            if (separator <= 0) {
+                continue;
+            }
+
+            String key = normalized.substring(0, separator).trim();
+            String value = normalized.substring(separator + 1).trim();
+            values.put(key, value);
+        }
+
+        return values;
+    }
+
+    private static Map<String, String> createDefaultXpaths() {
+        Map<String, String> defaults = new LinkedHashMap<>();
+        defaults.put("Artist", "//input[@name='artist']");
+        defaults.put("Title", "//input[@name='title']");
+        defaults.put("Tracks", "//input[starts-with(@name,'track')]");
+        defaults.put("Type - Jewel case", "//input[@name='template' and @value='jewel']");
+        defaults.put("Paper - A4", "//input[@name='size' and @value='a4']");
+        defaults.put("Force Save As - Yes", "//input[@name='force_saveas' and @value='yes']");
+        defaults.put("Generate button", "//input[@name='submit']");
+        return defaults;
+    }
+
+    private static void waitForPdfDownload() throws IOException {
         long deadline = System.currentTimeMillis() + Duration.ofSeconds(60).toMillis();
-        Path downloaded = RESULT_DIR.resolve("papercdcase.pdf");
 
         while (System.currentTimeMillis() < deadline) {
-            if (Files.exists(downloaded) && !Files.exists(RESULT_DIR.resolve("papercdcase.pdf.crdownload"))) {
-                try {
-                    Files.move(downloaded, TEMP_RESULT_FILE, StandardCopyOption.REPLACE_EXISTING);
-                    replaceResultFile();
-                    return;
-                } catch (IOException e) {
-                    throw new IllegalStateException(
-                            "Could not save PDF to result/cd.pdf. Close the old PDF file if it is open and run again.",
-                            e);
-                }
+            Path partialDownload = OUTPUT_DIRECTORY.resolve("papercdcase.pdf.crdownload");
+            if (Files.exists(DOWNLOADED_FILE) && !Files.exists(partialDownload)) {
+                Files.move(DOWNLOADED_FILE, TEMP_FILE, StandardCopyOption.REPLACE_EXISTING);
+                Files.move(TEMP_FILE, OUTPUT_FILE, StandardCopyOption.REPLACE_EXISTING);
+                return;
             }
 
             try {
                 Thread.sleep(500);
-            } catch (InterruptedException e) {
+            } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
-                throw new IllegalStateException("Interrupted while waiting for PDF download.", e);
+                throw new IllegalStateException("Waiting for the downloaded PDF was interrupted.", exception);
             }
         }
 
-        throw new IllegalStateException("PDF was not downloaded to " + RESULT_DIR + " within 60 seconds.");
+        throw new IllegalStateException("The PDF file was not downloaded within the expected time.");
     }
 
-    private static void replaceResultFile() throws IOException {
-        try {
-            Files.move(TEMP_RESULT_FILE, RESULT_FILE, StandardCopyOption.REPLACE_EXISTING);
-        } catch (IOException e) {
-            throw new IOException("result/cd.pdf is busy. Close it in the PDF viewer or browser.", e);
-        }
-    }
-
-    private record CdData(String artist, String title, List<String> tracks) {
+    private record AlbumData(String artist, String album, List<String> tracks) {
     }
 }
