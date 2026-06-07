@@ -1,0 +1,17 @@
+﻿/target/
+/drivers/
+chromedriver*
+*.crdownload
+/.idea/
+/.vscode/
+/.settings/
+/.classpath
+/.project
+*.iml
+*.log
+*.tmp
+*.bak
+*.swp
+Thumbs.db
+Desktop.ini
+hs_err_pid*
