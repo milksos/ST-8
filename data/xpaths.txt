@@ -1,7 +1,0 @@
-Artist: //input[@name='artist']
-Title: //input[@name='title']
-Tracks: //input[starts-with(@name,'track')]
-Track 1: //input[@name='track1']
-Type - Jewel case: //input[@name='template' and @value='jewel']
-Paper - A4: //input[@name='size' and @value='a4']
-Generate button: //input[@name='submit']

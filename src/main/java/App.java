@@ -1,4 +1,4 @@
-import org.openqa.selenium.By;
+﻿import org.openqa.selenium.By;
 import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.WebElement;
 import org.openqa.selenium.chrome.ChromeDriver;
@@ -13,127 +13,220 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
+import java.util.Optional;
 
 public class App {
-    private static final String BASE_URL = "https://www.papercdcase.com/";
+    private static final String SERVICE_URL = "https://www.papercdcase.com/";
+    private static final int MAX_TRACKS_ON_FORM = 18;
+    private static final Duration FORM_LOAD_TIMEOUT = Duration.ofSeconds(25);
+    private static final Duration FILE_DOWNLOAD_TIMEOUT = Duration.ofSeconds(75);
+
     private static final Path DATA_FILE = Paths.get("data", "data.txt");
-    private static final Path RESULT_DIR = Paths.get("result").toAbsolutePath();
-    private static final Path RESULT_FILE = RESULT_DIR.resolve("cd.pdf");
-    private static final Path TEMP_RESULT_FILE = RESULT_DIR.resolve("cd-new.pdf");
-    private static final Path LOCAL_DRIVER = Paths.get("drivers", "chromedriver-win64", "chromedriver.exe");
+    private static final Path RESULT_FOLDER = Paths.get("result").toAbsolutePath();
+    private static final Path RESULT_PDF = RESULT_FOLDER.resolve("cd.pdf");
 
     public static void main(String[] args) throws IOException {
-        CdData data = readData(DATA_FILE);
-        Files.createDirectories(RESULT_DIR);
-        Files.deleteIfExists(TEMP_RESULT_FILE);
+        Album album = Album.readFrom(DATA_FILE);
+        BrowserSettings browserSettings = new BrowserSettings(RESULT_FOLDER);
 
-        if (Files.exists(LOCAL_DRIVER)) {
-            System.setProperty("webdriver.chrome.driver", LOCAL_DRIVER.toAbsolutePath().toString());
-        }
+        Files.createDirectories(RESULT_FOLDER);
+        clearPreviousPdfFiles();
 
-        ChromeOptions options = new ChromeOptions();
-        options.setAcceptInsecureCerts(true);
-        options.addArguments("--ignore-certificate-errors");
-        options.addArguments("--disable-popup-blocking");
-
-        if (Boolean.getBoolean("headless")) {
-            options.addArguments("--headless=new");
-        }
-
-        Map<String, Object> prefs = new HashMap<>();
-        prefs.put("download.default_directory", RESULT_DIR.toString());
-        prefs.put("download.prompt_for_download", false);
-        prefs.put("plugins.always_open_pdf_externally", true);
-        options.setExperimentalOption("prefs", prefs);
-
-        WebDriver webDriver = new ChromeDriver(options);
+        WebDriver driver = new ChromeDriver(browserSettings.toChromeOptions());
         try {
-            WebDriverWait wait = new WebDriverWait(webDriver, Duration.ofSeconds(30));
-            webDriver.get(BASE_URL);
+            PaperCasePage page = new PaperCasePage(driver);
+            page.open();
+            page.fill(album);
+            page.generatePdf();
 
-            wait.until(ExpectedConditions.visibilityOfElementLocated(By.name("artist"))).sendKeys(data.artist());
-            webDriver.findElement(By.name("title")).sendKeys(data.title());
-
-            for (int i = 0; i < data.tracks().size(); i++) {
-                webDriver.findElement(By.name("track" + (i + 1))).sendKeys(data.tracks().get(i));
-            }
-
-            webDriver.findElement(By.cssSelector("input[name='template'][value='jewel']")).click();
-            webDriver.findElement(By.cssSelector("input[name='size'][value='a4']")).click();
-
-            WebElement forceSaveAs = webDriver.findElement(By.cssSelector("input[name='force_saveas'][value='yes']"));
-            if (!forceSaveAs.isSelected()) {
-                forceSaveAs.click();
-            }
-
-            WebElement btn = webDriver.findElement(By.name("submit"));
-            btn.submit();
-
-            waitForPdf();
-            System.out.println("PDF saved to " + RESULT_FILE);
+            Path downloaded = waitForDownload();
+            Files.move(downloaded, RESULT_PDF, StandardCopyOption.REPLACE_EXISTING);
+            System.out.println("Saved paper case PDF: " + RESULT_PDF);
         } finally {
-            webDriver.quit();
+            driver.quit();
         }
     }
 
-    private static CdData readData(Path path) throws IOException {
-        List<String> lines = Files.readAllLines(path, StandardCharsets.UTF_8).stream()
-                .map(String::trim)
-                .filter(line -> !line.isEmpty())
-                .collect(Collectors.toList());
-
-        if (lines.size() < 3) {
-            throw new IllegalArgumentException("data/data.txt must contain artist, album title and at least one track.");
-        }
-
-        List<String> tracks = lines.subList(2, Math.min(lines.size(), 18));
-        if (tracks.size() > 16) {
-            tracks = tracks.subList(0, 16);
-        }
-
-        return new CdData(lines.get(0), lines.get(1), tracks);
+    private static void clearPreviousPdfFiles() throws IOException {
+        Files.deleteIfExists(RESULT_PDF);
+        Files.deleteIfExists(RESULT_FOLDER.resolve("papercdcase.pdf"));
+        Files.deleteIfExists(RESULT_FOLDER.resolve("papercdcase.pdf.crdownload"));
     }
 
-    private static void waitForPdf() {
-        long deadline = System.currentTimeMillis() + Duration.ofSeconds(60).toMillis();
-        Path downloaded = RESULT_DIR.resolve("papercdcase.pdf");
+    private static Path waitForDownload() {
+        Path completeFile = RESULT_FOLDER.resolve("papercdcase.pdf");
+        Path browserTempFile = RESULT_FOLDER.resolve("papercdcase.pdf.crdownload");
+        long finishAt = System.currentTimeMillis() + FILE_DOWNLOAD_TIMEOUT.toMillis();
 
-        while (System.currentTimeMillis() < deadline) {
-            if (Files.exists(downloaded) && !Files.exists(RESULT_DIR.resolve("papercdcase.pdf.crdownload"))) {
-                try {
-                    Files.move(downloaded, TEMP_RESULT_FILE, StandardCopyOption.REPLACE_EXISTING);
-                    replaceResultFile();
-                    return;
-                } catch (IOException e) {
-                    throw new IllegalStateException(
-                            "Could not save PDF to result/cd.pdf. Close the old PDF file if it is open and run again.",
-                            e);
-                }
+        while (System.currentTimeMillis() < finishAt) {
+            if (Files.exists(completeFile) && !Files.exists(browserTempFile)) {
+                return completeFile;
             }
-
-            try {
-                Thread.sleep(500);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException("Interrupted while waiting for PDF download.", e);
-            }
+            pause();
         }
 
-        throw new IllegalStateException("PDF was not downloaded to " + RESULT_DIR + " within 60 seconds.");
+        throw new IllegalStateException("Browser did not finish PDF download in "
+                + FILE_DOWNLOAD_TIMEOUT.getSeconds() + " seconds.");
     }
 
-    private static void replaceResultFile() throws IOException {
+    private static void pause() {
         try {
-            Files.move(TEMP_RESULT_FILE, RESULT_FILE, StandardCopyOption.REPLACE_EXISTING);
-        } catch (IOException e) {
-            throw new IOException("result/cd.pdf is busy. Close it in the PDF viewer or browser.", e);
+            Thread.sleep(350);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Waiting for browser download was interrupted.", exception);
         }
     }
 
-    private record CdData(String artist, String title, List<String> tracks) {
+    private static final class PaperCasePage {
+        private final WebDriver driver;
+        private final WebDriverWait wait;
+
+        private PaperCasePage(WebDriver driver) {
+            this.driver = driver;
+            this.wait = new WebDriverWait(driver, FORM_LOAD_TIMEOUT);
+        }
+
+        private void open() {
+            driver.get(SERVICE_URL);
+            wait.until(ExpectedConditions.visibilityOfElementLocated(Selectors.artist()));
+        }
+
+        private void fill(Album album) {
+            write(Selectors.artist(), album.artist);
+            write(Selectors.title(), album.title);
+            writeTracks(album.tracks);
+            clickIfNeeded(Selectors.jewelCase());
+            clickIfNeeded(Selectors.a4Paper());
+            clickIfNeeded(Selectors.saveAsPdf());
+        }
+
+        private void generatePdf() {
+            driver.findElement(Selectors.submit()).submit();
+        }
+
+        private void write(By locator, String value) {
+            WebElement input = driver.findElement(locator);
+            input.clear();
+            input.sendKeys(value);
+        }
+
+        private void writeTracks(List<String> tracks) {
+            List<WebElement> inputs = driver.findElements(Selectors.trackInputs());
+            int limit = Math.min(Math.min(tracks.size(), inputs.size()), MAX_TRACKS_ON_FORM);
+
+            for (int index = 0; index < limit; index++) {
+                WebElement input = inputs.get(index);
+                input.clear();
+                input.sendKeys(tracks.get(index));
+            }
+        }
+
+        private void clickIfNeeded(By locator) {
+            WebElement control = driver.findElement(locator);
+            if (!control.isSelected()) {
+                control.click();
+            }
+        }
+    }
+
+    private static final class Selectors {
+        private static By artist() {
+            return By.name("artist");
+        }
+
+        private static By title() {
+            return By.name("title");
+        }
+
+        private static By trackInputs() {
+            return By.cssSelector("input[name^='track']");
+        }
+
+        private static By jewelCase() {
+            return By.cssSelector("input[name='template'][value='jewel']");
+        }
+
+        private static By a4Paper() {
+            return By.cssSelector("input[name='size'][value='a4']");
+        }
+
+        private static By saveAsPdf() {
+            return By.cssSelector("input[name='force_saveas'][value='yes']");
+        }
+
+        private static By submit() {
+            return By.name("submit");
+        }
+    }
+
+    private static final class BrowserSettings {
+        private final Path downloadFolder;
+
+        private BrowserSettings(Path downloadFolder) {
+            this.downloadFolder = downloadFolder;
+        }
+
+        private ChromeOptions toChromeOptions() {
+            ChromeOptions options = new ChromeOptions();
+            options.setAcceptInsecureCerts(true);
+            options.addArguments("--ignore-certificate-errors");
+            options.addArguments("--disable-popup-blocking");
+
+            if (Boolean.getBoolean("headless")) {
+                options.addArguments("--headless=new");
+            }
+
+            Map<String, Object> preferences = new HashMap<>();
+            preferences.put("download.default_directory", downloadFolder.toString());
+            preferences.put("download.prompt_for_download", false);
+            preferences.put("plugins.always_open_pdf_externally", true);
+            options.setExperimentalOption("prefs", preferences);
+
+            return options;
+        }
+    }
+
+    private static final class Album {
+        private final String artist;
+        private final String title;
+        private final List<String> tracks;
+
+        private Album(String artist, String title, List<String> tracks) {
+            this.artist = artist;
+            this.title = title;
+            this.tracks = tracks;
+        }
+
+        private static Album readFrom(Path path) throws IOException {
+            List<String> rows = new ArrayList<>();
+            for (String row : Files.readAllLines(path, StandardCharsets.UTF_8)) {
+                Optional<String> normalized = normalizeRow(row);
+                normalized.ifPresent(rows::add);
+            }
+
+            if (rows.size() < 3) {
+                throw new IllegalArgumentException("Expected artist, title and track list in " + path + ".");
+            }
+
+            List<String> tracks = new ArrayList<>();
+            for (int index = 2; index < rows.size() && tracks.size() < MAX_TRACKS_ON_FORM; index++) {
+                tracks.add(rows.get(index));
+            }
+
+            return new Album(rows.get(0), rows.get(1), tracks);
+        }
+
+        private static Optional<String> normalizeRow(String row) {
+            String value = row.trim();
+            if (value.isEmpty() || value.startsWith("#")) {
+                return Optional.empty();
+            }
+            return Optional.of(value);
+        }
     }
 }
