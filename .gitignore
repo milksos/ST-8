@@ -12,6 +12,7 @@ chromedriver*
 *.tmp
 *.bak
 *.swp
+
 Thumbs.db
 Desktop.ini
 hs_err_pid*
